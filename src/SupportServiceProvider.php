@@ -125,7 +125,7 @@ class SupportServiceProvider extends AbstractServiceProvider
                 // tickets to one person, the reply notification would go to
                 // the whole staff list and undo that routing.
                 if (! $reply->is_internal_note && ! $isOpening) {
-                    $bus->dispatch(new NotifyNewReply($reply->id));
+                    static::afterCommit(fn () => $bus->dispatch(new NotifyNewReply($reply->id)));
                 }
             } catch (\Throwable $e) {
                 $log->warning('[linkrobins/support] reply post-save hook failed', ['exception' => $e]);
@@ -137,7 +137,10 @@ class SupportServiceProvider extends AbstractServiceProvider
         // ticket doesn't get notified about their own ticket.
         SupportTicket::created(function (SupportTicket $ticket) use ($bus, $events, $log) {
             try {
-                $bus->dispatch(new NotifyNewTicket($ticket->id));
+                // After the commit: on the sync queue this keeps staff emails
+                // out of the create transaction (and its user row lock); on an
+                // async queue it stops a worker loading the ticket too early.
+                static::afterCommit(fn () => $bus->dispatch(new NotifyNewTicket($ticket->id)));
                 static::afterCommit(fn () => $events->dispatch(new TicketChanged($ticket, $ticket->user)));
                 // After the commit, which on the API's create path is after
                 // the opening message is saved too.
