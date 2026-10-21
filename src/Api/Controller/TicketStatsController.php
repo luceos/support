@@ -7,7 +7,9 @@ use Carbon\CarbonInterface;
 use Flarum\Http\RequestUtil;
 use Flarum\User\Exception\PermissionDeniedException;
 use Flarum\User\User;
+use Illuminate\Database\Eloquent\Collection as EloquentCollection;
 use Illuminate\Support\Arr;
+use Illuminate\Support\Collection;
 use Laminas\Diactoros\Response\JsonResponse;
 use LinkRobins\Support\Access\SupportAbilities;
 use LinkRobins\Support\SupportEvent;
@@ -52,10 +54,7 @@ class TicketStatsController implements RequestHandlerInterface
         $now = Carbon::now();
         $since = $now->copy()->subDays($days);
 
-        $staffQuery = User::query();
-        SupportAbilities::whereStaff($staffQuery);
-        /** @var array<int, User> $staff */
-        $staff = $staffQuery->get(['id', 'username'])->keyBy('id')->all();
+        $staff = $this->staffMembers();
         $staffIds = array_keys($staff);
 
         $tickets = SupportTicket::query()
@@ -67,136 +66,9 @@ class TicketStatsController implements RequestHandlerInterface
         $owners = $tickets->pluck('user_id', 'id')->all();
         $openedAt = $tickets->mapWithKeys(fn (SupportTicket $t) => [$t->id => $t->created_at])->all();
 
-        // First staff reply on each ticket opened in the window. A staff
-        // member's own ticket waits for someone else's answer. Read as plain
-        // rows (toBase keeps the soft-delete scope): the sample can be
-        // thousands of replies and none of them needs to be a model.
-        $firstResponse = [];
-        $firstResponder = [];
-        if ($ticketIds && $staffIds) {
-            SupportReply::query()
-                ->toBase()
-                ->whereIn('ticket_id', $ticketIds)
-                ->whereIn('user_id', $staffIds)
-                ->where('is_internal_note', false)
-                ->orderBy('created_at')
-                ->get(['ticket_id', 'user_id', 'created_at'])
-                ->each(function (object $reply) use (&$firstResponse, &$firstResponder, $owners, $openedAt) {
-                    $ticketId = (int) $reply->ticket_id;
-                    if (isset($firstResponse[$ticketId]) || (int) $reply->user_id === (int) ($owners[$ticketId] ?? 0)) {
-                        return;
-                    }
-                    $firstResponse[$ticketId] = $this->seconds($openedAt[$ticketId] ?? null, Carbon::parse($reply->created_at));
-                    $firstResponder[$ticketId] = (int) $reply->user_id;
-                });
-        }
-
-        // First move to resolved (or straight to closed) on each of them.
-        $resolveTimes = [];
-        if ($ticketIds) {
-            SupportEvent::query()
-                ->toBase()
-                ->whereIn('ticket_id', $ticketIds)
-                ->where('type', SupportEvent::TYPE_STATUS)
-                ->whereIn('to_status', [SupportTicket::STATUS_RESOLVED, SupportTicket::STATUS_CLOSED])
-                ->orderBy('created_at')
-                ->get(['ticket_id', 'created_at'])
-                ->each(function (object $event) use (&$resolveTimes, $openedAt) {
-                    $ticketId = (int) $event->ticket_id;
-                    if (! isset($resolveTimes[$ticketId])) {
-                        $resolveTimes[$ticketId] = $this->seconds($openedAt[$ticketId] ?? null, Carbon::parse($event->created_at));
-                    }
-                });
-        }
-
-        // Closes in the window, for volume and for how tickets end. Not
-        // sampled, since the closed total must be exact, so kept to plain
-        // rows with the ticket owner joined in rather than a model and an
-        // eager-loaded ticket per close. A trashed ticket has no owner here,
-        // as it had none through the relation.
-        $events = (new SupportEvent())->getTable();
-        $ticketsTable = (new SupportTicket())->getTable();
-        $closes = SupportEvent::query()
-            ->toBase()
-            ->leftJoin($ticketsTable, function ($join) use ($events, $ticketsTable) {
-                $join->on($ticketsTable.'.id', '=', $events.'.ticket_id')
-                    ->whereNull($ticketsTable.'.deleted_at');
-            })
-            ->where($events.'.type', SupportEvent::TYPE_STATUS)
-            ->where($events.'.to_status', SupportTicket::STATUS_CLOSED)
-            ->where($events.'.created_at', '>=', $since)
-            ->get([$events.'.user_id', $events.'.from_status', $events.'.created_at', $ticketsTable.'.user_id as owner_id']);
-
-        $endings = ['confirmed' => 0, 'auto' => 0, 'staff' => 0];
-        foreach ($closes as $close) {
-            if ($close->from_status !== SupportTicket::STATUS_RESOLVED) {
-                continue;
-            }
-            if ($close->user_id === null) {
-                $endings['auto']++;
-            } elseif ($close->owner_id !== null && (int) $close->user_id === (int) $close->owner_id) {
-                $endings['confirmed']++;
-            } else {
-                $endings['staff']++;
-            }
-        }
-
-        // Volume per period: days for a week, weeks otherwise.
-        $buckets = $this->buckets($since, $now, $days === 7 ? 'day' : 'week');
-        $bucketKey = fn (CarbonInterface $at) => $days === 7 ? $at->copy()->startOfDay()->toDateString() : $at->copy()->startOfWeek()->toDateString();
-        foreach ($tickets as $ticket) {
-            /** @var SupportTicket $ticket */
-            $key = $bucketKey($ticket->created_at);
-            if (isset($buckets[$key])) {
-                $buckets[$key]['opened']++;
-            }
-        }
-        foreach ($closes as $close) {
-            $key = $bucketKey(Carbon::parse($close->created_at));
-            if (isset($buckets[$key])) {
-                $buckets[$key]['closed']++;
-            }
-        }
-
-        // The current backlog, not limited to the window.
-        $waiting = fn () => SupportTicket::query()->whereIn('status', [
-            SupportTicket::STATUS_OPEN,
-            SupportTicket::STATUS_IN_PROGRESS,
-            SupportTicket::STATUS_AWAITING_USER,
-        ]);
-
-        // Per staff member, over the window. Counted by the database: one row
-        // per staff member, however many replies the window holds.
-        $people = [];
-        if ($staffIds) {
-            $perStaff = SupportReply::query()
-                ->toBase()
-                ->whereIn('user_id', $staffIds)
-                ->where('is_internal_note', false)
-                ->where('created_at', '>=', $since)
-                ->groupBy('user_id')
-                ->select('user_id')
-                ->selectRaw('COUNT(*) as replies, COUNT(DISTINCT ticket_id) as tickets')
-                ->get()
-                ->keyBy('user_id');
-            foreach ($staff as $id => $member) {
-                $mine = $perStaff->get($id);
-                $responses = array_values(array_intersect_key($firstResponse, array_filter($firstResponder, fn ($who) => $who === $id)));
-                if (! $mine && ! $responses) {
-                    continue;
-                }
-                $people[] = [
-                    'id' => (string) $id,
-                    'username' => $member->username,
-                    'displayName' => $member->display_name,
-                    'replies' => $mine ? (int) $mine->replies : 0,
-                    'tickets' => $mine ? (int) $mine->tickets : 0,
-                    'firstResponses' => count($responses),
-                    'medianFirstResponse' => $this->percentile($responses, 50),
-                ];
-            }
-            usort($people, fn ($a, $b) => $b['replies'] <=> $a['replies']);
-        }
+        [$firstResponse, $firstResponder] = $this->firstResponses($ticketIds, $staffIds, $owners, $openedAt);
+        $resolveTimes = $this->resolveTimes($ticketIds, $openedAt);
+        $closes = $this->closes($since);
 
         return new JsonResponse(['data' => [
             'days' => $days,
@@ -213,16 +85,249 @@ class TicketStatsController implements RequestHandlerInterface
                 'p90' => $this->percentile(array_values($resolveTimes), 90),
                 'resolved' => count($resolveTimes),
             ],
-            'backlog' => [
-                'waiting' => $waiting()->count(),
-                'olderThan3Days' => $waiting()->where('created_at', '<=', $now->copy()->subDays(3))->count(),
-                'olderThan7Days' => $waiting()->where('created_at', '<=', $now->copy()->subDays(7))->count(),
-                'unassigned' => $waiting()->whereNull('assigned_staff_id')->count(),
-            ],
-            'endings' => $endings,
-            'volume' => array_values($buckets),
-            'staff' => $people,
+            'backlog' => $this->backlog($now),
+            'endings' => $this->endings($closes),
+            'volume' => $this->volume($tickets, $closes, $since, $now, $days),
+            'staff' => $this->staffStats($staff, $since, $firstResponse, $firstResponder),
         ]]);
+    }
+
+    /**
+     * Everyone who counts as staff, keyed by id.
+     *
+     * @return array<int, User>
+     */
+    protected function staffMembers(): array
+    {
+        $query = User::query();
+        SupportAbilities::whereStaff($query);
+
+        return $query->get(['id', 'username'])->keyBy('id')->all();
+    }
+
+    /**
+     * First staff reply on each ticket opened in the window: seconds to it,
+     * and who gave it, both keyed by ticket id. A staff member's own ticket
+     * waits for someone else's answer. Read as plain rows (toBase keeps the
+     * soft-delete scope): the sample can be thousands of replies and none of
+     * them needs to be a model.
+     *
+     * @param list<int> $ticketIds
+     * @param list<int> $staffIds
+     * @param array<int, int|null> $owners
+     * @param array<int, CarbonInterface|null> $openedAt
+     * @return array{0: array<int, int>, 1: array<int, int>}
+     */
+    protected function firstResponses(array $ticketIds, array $staffIds, array $owners, array $openedAt): array
+    {
+        $firstResponse = [];
+        $firstResponder = [];
+
+        if (! $ticketIds || ! $staffIds) {
+            return [$firstResponse, $firstResponder];
+        }
+
+        SupportReply::query()
+            ->toBase()
+            ->whereIn('ticket_id', $ticketIds)
+            ->whereIn('user_id', $staffIds)
+            ->where('is_internal_note', false)
+            ->orderBy('created_at')
+            ->get(['ticket_id', 'user_id', 'created_at'])
+            ->each(function (object $reply) use (&$firstResponse, &$firstResponder, $owners, $openedAt) {
+                $ticketId = (int) $reply->ticket_id;
+                if (isset($firstResponse[$ticketId]) || (int) $reply->user_id === (int) ($owners[$ticketId] ?? 0)) {
+                    return;
+                }
+                $firstResponse[$ticketId] = $this->seconds($openedAt[$ticketId] ?? null, Carbon::parse($reply->created_at));
+                $firstResponder[$ticketId] = (int) $reply->user_id;
+            });
+
+        return [$firstResponse, $firstResponder];
+    }
+
+    /**
+     * Seconds to the first move to resolved (or straight to closed) on each
+     * ticket opened in the window, keyed by ticket id.
+     *
+     * @param list<int> $ticketIds
+     * @param array<int, CarbonInterface|null> $openedAt
+     * @return array<int, int>
+     */
+    protected function resolveTimes(array $ticketIds, array $openedAt): array
+    {
+        $resolveTimes = [];
+
+        if (! $ticketIds) {
+            return $resolveTimes;
+        }
+
+        SupportEvent::query()
+            ->toBase()
+            ->whereIn('ticket_id', $ticketIds)
+            ->where('type', SupportEvent::TYPE_STATUS)
+            ->whereIn('to_status', [SupportTicket::STATUS_RESOLVED, SupportTicket::STATUS_CLOSED])
+            ->orderBy('created_at')
+            ->get(['ticket_id', 'created_at'])
+            ->each(function (object $event) use (&$resolveTimes, $openedAt) {
+                $ticketId = (int) $event->ticket_id;
+                if (! isset($resolveTimes[$ticketId])) {
+                    $resolveTimes[$ticketId] = $this->seconds($openedAt[$ticketId] ?? null, Carbon::parse($event->created_at));
+                }
+            });
+
+        return $resolveTimes;
+    }
+
+    /**
+     * Closes in the window, for volume and for how tickets end. Not sampled,
+     * since the closed total must be exact, so kept to plain rows with the
+     * ticket owner joined in rather than a model and an eager-loaded ticket
+     * per close. A trashed ticket has no owner here, as it had none through
+     * the relation.
+     *
+     * @return Collection<int, \stdClass>
+     */
+    protected function closes(CarbonInterface $since): Collection
+    {
+        $events = (new SupportEvent())->getTable();
+        $tickets = (new SupportTicket())->getTable();
+
+        return SupportEvent::query()
+            ->toBase()
+            ->leftJoin($tickets, function ($join) use ($events, $tickets) {
+                $join->on($tickets.'.id', '=', $events.'.ticket_id')
+                    ->whereNull($tickets.'.deleted_at');
+            })
+            ->where($events.'.type', SupportEvent::TYPE_STATUS)
+            ->where($events.'.to_status', SupportTicket::STATUS_CLOSED)
+            ->where($events.'.created_at', '>=', $since)
+            ->get([$events.'.user_id', $events.'.from_status', $events.'.created_at', $tickets.'.user_id as owner_id']);
+    }
+
+    /**
+     * How resolved tickets were closed: confirmed by their owner, closed
+     * automatically, or closed by staff.
+     *
+     * @param Collection<int, \stdClass> $closes
+     * @return array{confirmed: int, auto: int, staff: int}
+     */
+    protected function endings(Collection $closes): array
+    {
+        $endings = ['confirmed' => 0, 'auto' => 0, 'staff' => 0];
+
+        foreach ($closes as $close) {
+            if ($close->from_status !== SupportTicket::STATUS_RESOLVED) {
+                continue;
+            }
+            if ($close->user_id === null) {
+                $endings['auto']++;
+            } elseif ($close->owner_id !== null && (int) $close->user_id === (int) $close->owner_id) {
+                $endings['confirmed']++;
+            } else {
+                $endings['staff']++;
+            }
+        }
+
+        return $endings;
+    }
+
+    /**
+     * Tickets opened and closed per period: days for a week, weeks otherwise.
+     *
+     * @param EloquentCollection<int, SupportTicket> $tickets
+     * @param Collection<int, \stdClass> $closes
+     * @return list<array{start: string, opened: int, closed: int}>
+     */
+    protected function volume(EloquentCollection $tickets, Collection $closes, CarbonInterface $since, CarbonInterface $now, int $days): array
+    {
+        $buckets = $this->buckets($since, $now, $days === 7 ? 'day' : 'week');
+        $bucketKey = fn (CarbonInterface $at) => $days === 7 ? $at->copy()->startOfDay()->toDateString() : $at->copy()->startOfWeek()->toDateString();
+
+        foreach ($tickets as $ticket) {
+            $key = $bucketKey($ticket->created_at);
+            if (isset($buckets[$key])) {
+                $buckets[$key]['opened']++;
+            }
+        }
+        foreach ($closes as $close) {
+            $key = $bucketKey(Carbon::parse($close->created_at));
+            if (isset($buckets[$key])) {
+                $buckets[$key]['closed']++;
+            }
+        }
+
+        return array_values($buckets);
+    }
+
+    /**
+     * The current backlog, not limited to the window.
+     *
+     * @return array{waiting: int, olderThan3Days: int, olderThan7Days: int, unassigned: int}
+     */
+    protected function backlog(CarbonInterface $now): array
+    {
+        $waiting = fn () => SupportTicket::query()->whereIn('status', [
+            SupportTicket::STATUS_OPEN,
+            SupportTicket::STATUS_IN_PROGRESS,
+            SupportTicket::STATUS_AWAITING_USER,
+        ]);
+
+        return [
+            'waiting' => $waiting()->count(),
+            'olderThan3Days' => $waiting()->where('created_at', '<=', $now->copy()->subDays(3))->count(),
+            'olderThan7Days' => $waiting()->where('created_at', '<=', $now->copy()->subDays(7))->count(),
+            'unassigned' => $waiting()->whereNull('assigned_staff_id')->count(),
+        ];
+    }
+
+    /**
+     * Per staff member, over the window, busiest first. Reply counts come
+     * from the database: one row per staff member, however many replies the
+     * window holds.
+     *
+     * @param array<int, User> $staff
+     * @param array<int, int> $firstResponse
+     * @param array<int, int> $firstResponder
+     * @return list<array<string, mixed>>
+     */
+    protected function staffStats(array $staff, CarbonInterface $since, array $firstResponse, array $firstResponder): array
+    {
+        if (! $staff) {
+            return [];
+        }
+
+        $perStaff = SupportReply::query()
+            ->toBase()
+            ->whereIn('user_id', array_keys($staff))
+            ->where('is_internal_note', false)
+            ->where('created_at', '>=', $since)
+            ->groupBy('user_id')
+            ->select('user_id')
+            ->selectRaw('COUNT(*) as replies, COUNT(DISTINCT ticket_id) as tickets')
+            ->get()
+            ->keyBy('user_id');
+
+        $people = [];
+        foreach ($staff as $id => $member) {
+            $mine = $perStaff->get($id);
+            $responses = array_values(array_intersect_key($firstResponse, array_filter($firstResponder, fn ($who) => $who === $id)));
+            if (! $mine && ! $responses) {
+                continue;
+            }
+            $people[] = [
+                'id' => (string) $id,
+                'username' => $member->username,
+                'displayName' => $member->display_name,
+                'replies' => $mine ? (int) $mine->replies : 0,
+                'tickets' => $mine ? (int) $mine->tickets : 0,
+                'firstResponses' => count($responses),
+                'medianFirstResponse' => $this->percentile($responses, 50),
+            ];
+        }
+        usort($people, fn ($a, $b) => $b['replies'] <=> $a['replies']);
+
+        return $people;
     }
 
     protected function seconds(?CarbonInterface $from, ?CarbonInterface $to): int
