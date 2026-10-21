@@ -23,6 +23,7 @@ use LinkRobins\Support\TicketType\TicketTypeManager;
  * @property string|null $ticket_type
  * @property int|null $default_assignee_id
  * @property array<int>|null $allowed_group_ids
+ * @property int $ticket_count
  * @property \Carbon\Carbon|null $created_at
  * @property \Carbon\Carbon|null $updated_at
  * @property-read User|null $defaultAssignee
@@ -48,6 +49,7 @@ class SupportCategory extends AbstractModel
 
     protected $casts = [
         'position'  => 'integer',
+        'ticket_count' => 'integer',
         'allowed_group_ids' => 'array',
     ];
 
@@ -77,6 +79,21 @@ class SupportCategory extends AbstractModel
     public function tickets(): HasMany
     {
         return $this->hasMany(SupportTicket::class, 'category_id');
+    }
+
+    /**
+     * Recount the stored ticket_count of the given categories. A recount
+     * rather than an increment, so a write that skipped the model hooks is
+     * corrected by the next ticket change instead of drifting for good.
+     * Soft-deleted tickets don't count, as with tickets().
+     */
+    public static function refreshTicketCount(int|string|null ...$ids): void
+    {
+        foreach (array_unique(array_filter(array_map('intval', $ids))) as $id) {
+            static::query()->whereKey($id)->update([
+                'ticket_count' => SupportTicket::query()->where('category_id', $id)->count(),
+            ]);
+        }
     }
 
     /**

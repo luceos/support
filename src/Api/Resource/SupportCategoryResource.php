@@ -39,9 +39,7 @@ class SupportCategoryResource extends AbstractDatabaseResource
 
     public function scope(Builder $query, Context $context): void
     {
-        // Eager-load the ticket count so the ticketCount field doesn't issue a
-        // COUNT() per category (N+1 on the category list).
-        $query->withCount('tickets')->orderBy('position')->orderBy('id');
+        $query->orderBy('position')->orderBy('id');
     }
 
     public function find(string $id, Context $context): ?object
@@ -202,8 +200,12 @@ class SupportCategoryResource extends AbstractDatabaseResource
                     return $cat->canCreate($context->getActor());
                 }),
 
+            // Stored on the category (see refreshTicketCount()), so reading it
+            // costs nothing. Only managers see it: it is ticket volume, which
+            // members and guests have no business knowing.
             Schema\Integer::make('ticketCount')
-                ->get(fn (SupportCategory $cat) => (int) ($cat->tickets_count ?? $cat->tickets()->count())),
+                ->property('ticket_count')
+                ->visible(fn (SupportCategory $cat, FlarumContext $context) => $context->getActor()->can('manageCategories')),
 
             Schema\DateTime::make('createdAt')
                 ->property('created_at'),

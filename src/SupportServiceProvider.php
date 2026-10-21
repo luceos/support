@@ -150,6 +150,21 @@ class SupportServiceProvider extends AbstractServiceProvider
             }
         });
 
+        // Keep each category's stored ticket_count current. Creating, moving,
+        // restoring and (soft or permanently) deleting a ticket all change a
+        // count; the previous category is recounted too when it moved.
+        SupportTicket::saved(function (SupportTicket $ticket) use ($log) {
+            if (! $ticket->wasRecentlyCreated && ! $ticket->wasChanged(['category_id', 'deleted_at'])) {
+                return;
+            }
+            $ids = [$ticket->category_id, $ticket->getOriginal('category_id')];
+            static::afterCommit(fn () => static::refreshTicketCounts($ids, $log));
+        });
+        SupportTicket::deleted(function (SupportTicket $ticket) use ($log) {
+            $ids = [$ticket->category_id];
+            static::afterCommit(fn () => static::refreshTicketCounts($ids, $log));
+        });
+
         // Stamp when the status last changed. Auto-close counts a resolved
         // ticket's quiet period from here (see CloseResolvedTicketsCommand).
         SupportTicket::saving(function (SupportTicket $ticket) {
@@ -282,6 +297,18 @@ class SupportServiceProvider extends AbstractServiceProvider
         }
 
         return $events;
+    }
+
+    /**
+     * @param array<int|null> $ids
+     */
+    protected static function refreshTicketCounts(array $ids, LoggerInterface $log): void
+    {
+        try {
+            SupportCategory::refreshTicketCount(...$ids);
+        } catch (\Throwable $e) {
+            $log->warning('[linkrobins/support] could not refresh category ticket count', ['exception' => $e]);
+        }
     }
 
     protected static function afterCommit(callable $callback): void

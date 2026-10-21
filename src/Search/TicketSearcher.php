@@ -20,10 +20,8 @@ class TicketSearcher extends AbstractSearcher
         $query = SupportTicket::query()->select('linkrobins_support_tickets.*');
 
         // Eager-load category so ticket-type drivers and permission checks don't
-        // trigger N+1 queries per ticket. Carry the ticket count with it: an
-        // `include=category` finds the relation already loaded and skips its own
-        // query, so without it ticketCount falls back to one COUNT per category.
-        $query->with(['category' => fn ($q) => $q->withCount('tickets')]);
+        // trigger N+1 queries per ticket.
+        $query->with('category');
 
         // Eager-load reply counts so the replyCount field doesn't fire a
         // COUNT() per ticket (N+1 on the list). Two variants: the full count
