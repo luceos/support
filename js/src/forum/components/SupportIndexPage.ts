@@ -9,7 +9,7 @@ import { basePath, BASE_PATH, formatDate, safeNavigate, showError } from '../uti
 import { canCreateSupportTicket, canHandleSupportTickets } from '../utils/permissions';
 import { statusChip, priorityChip, FILTER_OPTIONS, filterLabel, emptyLabel } from '../utils/status';
 import { loadTickets } from '../utils/api';
-import { onLive } from '../utils/live';
+import { onLive, throttleLive, LiveThrottle } from '../utils/live';
 import ItemList from 'flarum/common/utils/ItemList';
 import { ticketTypes } from '../../common/ticketTypes';
 
@@ -31,7 +31,7 @@ export default class SupportIndexPage extends Page {
   filter: string | null = 'mine';
   _lastLoadedFilter: string | null = 'mine';
   _stopLive: (() => void) | null = null;
-  _liveTimer: any = null;
+  _liveReload: LiveThrottle | null = null;
 
   oninit(vnode: any) {
     super.oninit(vnode);
@@ -49,19 +49,20 @@ export default class SupportIndexPage extends Page {
   oncreate(vnode: any) {
     super.oncreate(vnode);
     // A ticket opened or moved somewhere: refetch the list in place so new
-    // tickets appear and moved ones leave this view. Debounced, since one
-    // action can produce a few pushes in a row (a reply, then its status).
+    // tickets appear and moved ones leave this view. Throttled, since pushes
+    // arrive for activity anywhere on the desk (see throttleLive).
+    const reload = throttleLive(() => this._load(true));
+    this._liveReload = reload;
     this._stopLive = onLive((kind) => {
-      if (kind !== 'ticket') return;
-      clearTimeout(this._liveTimer);
-      this._liveTimer = setTimeout(() => this._load(true), 500);
+      if (kind === 'ticket') reload.call();
     });
   }
 
   onremove(vnode: any) {
     if (this._stopLive) this._stopLive();
     this._stopLive = null;
-    clearTimeout(this._liveTimer);
+    if (this._liveReload) this._liveReload.cancel();
+    this._liveReload = null;
     clearTimeout(this._searchTimer);
     super.onremove(vnode);
   }

@@ -66,3 +66,57 @@ export function installRealtime(): void {
     console.error('[linkrobins/support] realtime integration failed:', e);
   }
 }
+
+export interface LiveThrottle {
+  call(): void;
+  cancel(): void;
+}
+
+/**
+ * Fold live updates into occasional refetches, for views that reload a list
+ * rather than one ticket. Every connected staff member hears about activity
+ * on every ticket, so refetching per push scales with the whole desk.
+ *
+ * A run waits `delay` to gather a burst (a reply usually brings a ticket push
+ * with it), and runs are at least `interval` apart. While the tab is hidden
+ * nothing runs; one catch-up run follows when it is shown again.
+ */
+export function throttleLive(run: () => void, interval = 5000, delay = 500): LiveThrottle {
+  let timer: any = null;
+  let lastRun = 0;
+  let missed = false;
+
+  const fire = () => {
+    timer = null;
+    lastRun = Date.now();
+    run();
+  };
+
+  const onVisible = () => {
+    if (document.hidden || !missed) return;
+    missed = false;
+    throttle.call();
+  };
+
+  const throttle: LiveThrottle = {
+    call() {
+      if (document.hidden) {
+        missed = true;
+        return;
+      }
+      if (timer) return;
+      const now = Date.now();
+      timer = setTimeout(fire, Math.max(delay, lastRun + interval - now));
+    },
+    cancel() {
+      clearTimeout(timer);
+      timer = null;
+      missed = false;
+      document.removeEventListener('visibilitychange', onVisible);
+    },
+  };
+
+  document.addEventListener('visibilitychange', onVisible);
+
+  return throttle;
+}

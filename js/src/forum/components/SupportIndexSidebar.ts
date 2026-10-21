@@ -9,7 +9,7 @@ import { basePath, BASE_PATH, safeNavigate, showForumNavOnSupportPages } from '.
 import { canCreateSupportTicket, canHandleSupportTickets } from '../utils/permissions';
 import { FILTER_OPTIONS, filterLabel, filterHrefFor } from '../utils/status';
 import { refreshCounts, supportCount, COUNT_FOR_FILTER } from '../utils/counts';
-import { onLive } from '../utils/live';
+import { onLive, throttleLive, LiveThrottle } from '../utils/live';
 import SupportStatsModal from './SupportStatsModal';
 
 /**
@@ -32,16 +32,21 @@ class SupportViewsDropdown extends SelectDropdown<any> {
 
 export default class SupportIndexSidebar extends IndexSidebar<any> {
   _stopLive: (() => void) | null = null;
+  _liveCounts: LiveThrottle | null = null;
 
   oncreate(vnode: any) {
     super.oncreate(vnode);
     refreshCounts();
-    this._stopLive = onLive(() => refreshCounts());
+    const counts = throttleLive(refreshCounts);
+    this._liveCounts = counts;
+    this._stopLive = onLive(() => counts.call());
   }
 
   onremove(vnode: any) {
     if (this._stopLive) this._stopLive();
     this._stopLive = null;
+    if (this._liveCounts) this._liveCounts.cancel();
+    this._liveCounts = null;
     super.onremove(vnode);
   }
 

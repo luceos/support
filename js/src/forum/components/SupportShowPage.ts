@@ -410,14 +410,22 @@ export default class SupportShowPage extends Page<any> {
   }
 
   /**
-   * A live update arrived for this ticket (a ticket push carries its id; a
-   * reply push cannot say which ticket it belongs to, so it is treated as
-   * possibly ours). A ticket push has already been merged into the store, so
-   * the header and status bar redraw on their own.
+   * A live update arrived. A ticket push carries the ticket's id; a reply push
+   * carries linkage to its ticket, read raw because reply.ticket() resolves
+   * through the store and is empty for a ticket that was never loaded --
+   * exactly the case of another ticket's reply. Without linkage the reply is
+   * treated as possibly ours. A ticket push has already been merged into the
+   * store, so the header and status bar redraw on their own.
    */
   _onLive(kind: string, id: string | null) {
     if (!this.ticket || this.loading) return;
-    if (kind === 'ticket' && id !== String(this.ticket.id())) return;
+    const ours = String(this.ticket.id());
+    if (kind === 'ticket' && id !== ours) return;
+    if (kind === 'reply' && id) {
+      const reply: any = app.store.getById('linkrobins-support-replies', id);
+      const ticketId = reply?.data?.relationships?.ticket?.data?.id;
+      if (ticketId != null && String(ticketId) !== ours) return;
+    }
     this._catchUp();
   }
 
