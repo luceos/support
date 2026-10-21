@@ -133,6 +133,39 @@ class TicketStatsTest extends TestCase
     }
 
     #[Test]
+    public function per_staff_counts_replies_and_distinct_tickets_for_each_member(): void
+    {
+        $at = Carbon::now()->subDays(2);
+        $this->prepareDatabase([
+            'users' => [
+                ['id' => 4, 'username' => 'staffb', 'email' => 'staffb@machine.local', 'is_email_confirmed' => 1, 'password' => 'too-obscure'],
+            ],
+            'group_user' => [['user_id' => 4, 'group_id' => 100]],
+            'linkrobins_support_replies' => [
+                // staffa: two more public replies on ticket 1 (four public replies over two tickets in all).
+                ['id' => 7, 'ticket_id' => 1, 'user_id' => 3, 'content' => '<t>More</t>', 'is_internal_note' => 0, 'created_at' => $at, 'updated_at' => $at],
+                ['id' => 8, 'ticket_id' => 1, 'user_id' => 3, 'content' => '<t>More</t>', 'is_internal_note' => 0, 'created_at' => $at, 'updated_at' => $at],
+                // staffb: three public replies on two tickets, plus a note that doesn't count.
+                ['id' => 9, 'ticket_id' => 2, 'user_id' => 4, 'content' => '<t>Hi</t>', 'is_internal_note' => 0, 'created_at' => $at, 'updated_at' => $at],
+                ['id' => 10, 'ticket_id' => 2, 'user_id' => 4, 'content' => '<t>Hi</t>', 'is_internal_note' => 0, 'created_at' => $at, 'updated_at' => $at],
+                ['id' => 11, 'ticket_id' => 3, 'user_id' => 4, 'content' => '<t>Hi</t>', 'is_internal_note' => 0, 'created_at' => $at, 'updated_at' => $at],
+                ['id' => 12, 'ticket_id' => 3, 'user_id' => 4, 'content' => '<t>Note</t>', 'is_internal_note' => 1, 'created_at' => $at, 'updated_at' => $at],
+            ],
+        ]);
+
+        [, $data] = $this->stats(3);
+        $byName = array_column($data['staff'], null, 'username');
+
+        $this->assertSame(['staffa', 'staffb'], array_column($data['staff'], 'username'));
+        $this->assertEquals(4, $byName['staffa']['replies']);
+        $this->assertEquals(2, $byName['staffa']['tickets']);
+        $this->assertEquals(3, $byName['staffb']['replies']);
+        $this->assertEquals(2, $byName['staffb']['tickets']);
+        // Ticket 3 had no answer before staffb's reply.
+        $this->assertEquals(1, $byName['staffb']['firstResponses']);
+    }
+
+    #[Test]
     public function an_unknown_window_falls_back_to_thirty_days(): void
     {
         [, $data] = $this->stats(3, ['days' => '365']);
